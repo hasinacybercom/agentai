@@ -3,13 +3,8 @@
 import { Auth } from "@supabase/auth-ui-react";
 import { ThemeSupa } from "@supabase/auth-ui-shared";
 import { useEffect, useState } from "react";
-import { createClient } from "@supabase/supabase-js";
 import { useRouter } from "next/navigation";
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+import { supabase } from "@/lib/supabaseClient";
 
 export default function Home() {
   const router = useRouter();
@@ -63,27 +58,25 @@ export default function Home() {
   if (!session) {
     // Show Supabase Auth UI
     return (
-      <main className="flex min-h-screen items-center justify-center">
-        <Auth
-          supabaseClient={supabase}
-          appearance={{ theme: ThemeSupa }}
-          theme="dark"
-          providers={[]}
-        />
+      <main className="flex min-h-screen items-center justify-center bg-gradient-to-b from-white to-gray-50">
+        <div className="w-full max-w-md p-8">
+          <Auth
+            supabaseClient={supabase}
+            appearance={{ theme: ThemeSupa }}
+            theme="dark"
+            providers={[]}
+          />
+        </div>
       </main>
     );
   }
 
-  // Optional fallback if session exists but role redirection didn't trigger
+  // When authenticated we show a minimal redirecting state while redirectByRole runs
   return (
-    <main className="flex min-h-screen items-center justify-center flex-col">
-      <h1 className="text-2xl font-bold">Welcome, {session.user.email}</h1>
-      <a
-        href="/chat"
-        className="mt-4 rounded bg-blue-600 px-6 py-3 text-white hover:bg-blue-700"
-      >
-        Go to Chat
-      </a>
+    <main className="flex min-h-screen items-center justify-center bg-white">
+      <div className="text-center">
+        <div className="animate-pulse text-gray-600">Redirecting...</div>
+      </div>
     </main>
   );
 }
