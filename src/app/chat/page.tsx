@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 
 type Message = { role: "system" | "user" | "bot"; text: string };
 type Conversation = { id: string; title: string; scenario_id?: string | null };
+type Group = { key: string; title: string; items: Conversation[] };
 
 export default function ChatPage() {
   const [user, setUser] = useState<any>(null);
@@ -28,6 +29,10 @@ export default function ChatPage() {
   const [isDemo, setIsDemo] = useState(false);
   const [demoScenarioId, setDemoScenarioId] = useState<string | null>(null);
 
+  // Sidebar grouping state
+  const [scenarioTitleMap, setScenarioTitleMap] = useState<Record<string, string>>({});
+  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({});
+
   // Fetch current user and scenario
   useEffect(() => {
     async function initUser() {
@@ -44,7 +49,7 @@ export default function ChatPage() {
           .single();
         if (profile?.role === "admin") setIsAdmin(true);
 
-        loadConversations(data.user.id);
+        await loadConversations(data.user.id);
 
         const params = new URLSearchParams(window.location.search);
         const scenarioId = params.get("scenarioId");
@@ -65,6 +70,43 @@ export default function ChatPage() {
     initUser();
   }, []);
 
+  // Group conversations by scenario (collapsible)
+  const groupedConversations = useMemo<Group[]>(() => {
+    const buckets: Record<string, Conversation[]> = {};
+    for (const c of conversationsList) {
+      const key = c.scenario_id ?? "__none__";
+      if (!buckets[key]) buckets[key] = [];
+      buckets[key].push(c);
+    }
+
+    const groups: Group[] = Object.entries(buckets).map(([key, items]) => {
+      const isNone = key === "__none__";
+      return {
+        key,
+        title: isNone ? "No scenario" : (scenarioTitleMap[key] ?? "Scenario"),
+        items,
+      };
+    });
+
+    // Sort by scenario title; "No scenario" last
+    return groups.sort((a, b) => {
+      if (a.key === "__none__") return 1;
+      if (b.key === "__none__") return -1;
+      return a.title.localeCompare(b.title);
+    });
+  }, [conversationsList, scenarioTitleMap]);
+
+  // Expand all groups by default when they appear
+  useEffect(() => {
+    setExpandedGroups((prev) => {
+      const next = { ...prev };
+      for (const g of groupedConversations) {
+        if (next[g.key] === undefined) next[g.key] = true;
+      }
+      return next;
+    });
+  }, [groupedConversations]);
+
   // Load a scenario directly from the scenarios table (used for demo mode)
   async function loadScenarioByScenarioId(scenarioId: string) {
     const { data, error } = await supabase
@@ -81,6 +123,7 @@ export default function ChatPage() {
       // do not set currentScenarioRowId because this is a demo scenario (not assigned)
       setCurrentScenarioRowId(null);
       if (data.content) setSystemPrompt(data.content);
+      if (data.title) setScenarioTitle(data.title);
     }
   }
 
@@ -143,19 +186,40 @@ export default function ChatPage() {
 
     const rows = data ?? [];
 
-    // Dedupe by scenario_id so same scenario doesn't repeat in list.
-    const map = new Map<string, any>();
-    for (const r of rows) {
-      const key = r.scenario_id ?? `conv:${r.id}`;
-      if (!map.has(key)) map.set(key, r);
-      // rows are ordered desc so first is most recent
-    }
-    const deduped = Array.from(map.values()).map((r) => ({
+    // No dedupe — keep all conversations
+    const list = rows.map((r) => ({
       id: r.id,
       title: r.title,
       scenario_id: r.scenario_id ?? null,
     }));
-    setConversationsList(deduped);
+
+    setConversationsList(list);
+
+    // Fetch titles for the scenarios referenced by conversations
+    const scenarioIds = Array.from(
+      new Set(list.map((c) => c.scenario_id).filter(Boolean))
+    ) as string[];
+
+    if (scenarioIds.length) {
+      const { data: scenarioRows, error } = await supabase
+        .from("user_scenarios")
+        .select("id, scenarios ( title )")
+        .in("id", scenarioIds);
+
+      if (!error && scenarioRows) {
+        const map: Record<string, string> = {};
+        for (const row of scenarioRows as any[]) {
+          const scenariosObj: any = row.scenarios;
+          const title = Array.isArray(scenariosObj)
+            ? scenariosObj[0]?.title
+            : scenariosObj?.title;
+          map[row.id] = title ?? "Untitled scenario";
+        }
+        setScenarioTitleMap(map);
+      }
+    } else {
+      setScenarioTitleMap({});
+    }
   }
 
   async function selectConversation(convoId: string) {
@@ -179,7 +243,9 @@ export default function ChatPage() {
         setCurrentScenarioRowId(scenarioRow.id ?? null);
         const scenariosObj: any = scenarioRow.scenarios;
         const content = Array.isArray(scenariosObj) ? scenariosObj[0]?.content : scenariosObj?.content;
+        const title = Array.isArray(scenariosObj) ? scenariosObj[0]?.title : scenariosObj?.title;
         if (content) setSystemPrompt(content);
+        if (title) setScenarioTitle(title);
       }
     }
 
@@ -333,6 +399,92 @@ export default function ChatPage() {
     }
   }
 
+  // Export chat as PDF
+  const exportChatAsPdf = async () => {
+    if (!conversation || messages.length === 0) return;
+    try {
+      const { default: jsPDF } = await import("jspdf");
+
+      const doc = new jsPDF({ unit: "pt", format: "a4" });
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const margin = 40;
+      const contentWidth = pageWidth - margin * 2;
+      let y = margin;
+
+      const titleText = conversation?.title || "Chat";
+      const scenario = scenarioTitle ? scenarioTitle : (isDemo ? "Demo" : "No scenario");
+
+      doc.setProperties({
+        title: titleText,
+        subject: "Chat Export",
+        author: user?.email || "Demo AI",
+      });
+
+      // Header
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      doc.setTextColor(20);
+      doc.text(titleText, margin, y);
+      y += 22;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.setTextColor(90);
+      doc.text(`Scenario: ${scenario}`, margin, y);
+      y += 14;
+      doc.text(`Exported: ${new Date().toLocaleString()}`, margin, y);
+      y += 16;
+
+      doc.setDrawColor(220);
+      doc.line(margin, y, pageWidth - margin, y);
+      y += 16;
+
+      const addPageIfNeeded = (extra = 0) => {
+        if (y + extra > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+      };
+
+      const printBlock = (label: string, text: string) => {
+        const headerSize = 11;
+        const bodySize = 12;
+        const bodyLineHeight = 16;
+
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(headerSize);
+        doc.setTextColor(50);
+        addPageIfNeeded(headerSize + 6);
+        doc.text(label, margin, y);
+        y += headerSize + 6;
+
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(bodySize);
+        doc.setTextColor(20);
+
+        const lines = doc.splitTextToSize(text || "", contentWidth);
+        for (const line of lines) {
+          addPageIfNeeded(bodyLineHeight);
+          doc.text(line, margin, y);
+          y += bodyLineHeight;
+        }
+
+        y += 8;
+      };
+
+      messages.forEach((m) => {
+        const label = m.role === "user" ? "You" : m.role === "bot" ? "Bot" : "System";
+        printBlock(label, m.text);
+      });
+
+      const safe = (s: string) => s.replace(/[\\/:*?"<>|]/g, "-").slice(0, 100);
+      doc.save(`${safe(titleText)}.pdf`);
+    } catch (e) {
+      console.error("Failed to export PDF", e);
+    }
+  };
+
   return (
     <div className="flex flex-col md:flex-row min-h-screen bg-gray-50">
       {/* Mobile header */}
@@ -408,26 +560,51 @@ export default function ChatPage() {
         )}
 
         <div className="flex-1 overflow-y-auto mb-4">
-          <h3 className="text-sm font-medium text-gray-400 mb-2">Recent chats</h3>
-          <ul className="space-y-1">
-            {conversationsList.map((c) => (
-              <li key={c.id}>
+          <h3 className="text-sm font-medium text-gray-400 mb-2">Chats by scenario</h3>
+          <div className="space-y-2">
+            {groupedConversations.map((group) => (
+              <div key={group.key} className="rounded-md">
                 <button
-                  className={`w-full text-left p-3 rounded-md transition-colors ${
-                    conversation?.id === c.id 
-                      ? "bg-indigo-700 text-white" 
-                      : "text-gray-300 hover:bg-gray-700"
-                  }`}
-                  onClick={() => selectConversation(c.id)}
+                  className="w-full flex items-center justify-between px-3 py-2 rounded-md hover:bg-gray-700 transition-colors"
+                  onClick={() =>
+                    setExpandedGroups((s) => ({ ...s, [group.key]: !s[group.key] }))
+                  }
                 >
-                  <div className="flex items-center justify-between">
-                    <div className="truncate">{c.title}</div>
-                    {c.scenario_id && <span className="text-xs bg-indigo-600 px-2 py-0.5 rounded text-white ml-2">Scenario</span>}
+                  <div className="flex items-center gap-2">
+                    <svg
+                      className={`w-4 h-4 transform transition-transform ${expandedGroups[group.key] ? "rotate-90" : ""}`}
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
+                    </svg>
+                    <span className="font-medium">{group.title}</span>
                   </div>
+                  <span className="text-xs bg-gray-700 px-2 py-0.5 rounded">{group.items.length}</span>
                 </button>
-              </li>
+
+                {expandedGroups[group.key] && (
+                  <ul className="space-y-1 mt-1">
+                    {group.items.map((c) => (
+                      <li key={c.id}>
+                        <button
+                          className={`w-full text-left p-3 rounded-md transition-colors ${
+                            conversation?.id === c.id
+                              ? "bg-indigo-700 text-white"
+                              : "text-gray-300 hover:bg-gray-700"
+                          }`}
+                          onClick={() => selectConversation(c.id)}
+                        >
+                          <div className="truncate">{c.title}</div>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             ))}
-          </ul>
+          </div>
         </div>
 
         <div className="pt-4 border-t border-gray-700">
@@ -542,6 +719,16 @@ export default function ChatPage() {
                 >
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                  </svg>
+                </button>
+                <button
+                  onClick={exportChatAsPdf}
+                  disabled={!conversation || messages.length === 0}
+                  className="bg-gray-200 text-gray-700 p-3 rounded-lg hover:bg-gray-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  title="Export chat to PDF"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"></path>
                   </svg>
                 </button>
               </div>
